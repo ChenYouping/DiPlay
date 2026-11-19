@@ -137,6 +137,15 @@ object VideoFrameRelay {
                     clientSocket = socket
                     clientOut = DataOutputStream(socket.getOutputStream())
                     log("NPVS client connected: ${socket.remoteSocketAddress}")
+                    // A late client misses the one-shot config frame: avcC/hvcC is
+                    // pushed only when encoding parameters change, which usually
+                    // happens before any client connects. Re-send the cached config
+                    // now so a fresh decoder can be created immediately. Without
+                    // this the client only ever receives video frames and stalls
+                    // waiting for SPS/PPS forever.
+                    configRef.get()?.let { cfg ->
+                        push(kind = 1, codec = cfg.codecByte.toInt(), body = cfg.data.copyOf())
+                    }
                     // Keep the accepted socket alive; push() writes from the media thread.
                     // A reader watchdog detects disconnects that writes alone would miss.
                     val watchdog = Thread({

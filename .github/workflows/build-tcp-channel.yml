@@ -2,6 +2,9 @@ name: Build DiPlay + TCP channel (with identity)
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
 
 permissions:
   contents: read
