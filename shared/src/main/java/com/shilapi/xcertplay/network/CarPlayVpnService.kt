@@ -155,7 +155,9 @@ class CarPlayVpnService : VpnService() {
                 push.start()
                 videoPushServer = push
             }.onFailure { error ->
-                Log.w(TAG, "NPVS video mirror not started: ${error.message}")
+                val msg = "NPVS-WARN mirrorNotStarted err=${error.javaClass.simpleName}:${error.message}"
+                Log.w(TAG, msg)
+                runCatching { listener.onDebugLog(msg) }
             }
             AttachResult.Started
         } catch (error: Exception) {
