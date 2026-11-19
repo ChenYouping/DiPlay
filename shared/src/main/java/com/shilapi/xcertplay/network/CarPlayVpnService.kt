@@ -63,6 +63,7 @@ class CarPlayVpnService : VpnService() {
     @Volatile private var attachment: AirPlayAttachment? = null
     private var serverSocket: ServerSocket? = null
     private var additionalServers: List<ServerSocket> = emptyList()
+    private var probeChannel: DiplayTcpChannel? = null
     private var bridge: Ipv6NcmBridge? = null
     private var tun: ParcelFileDescriptor? = null
     private var attachGeneration = 0
@@ -117,10 +118,22 @@ class CarPlayVpnService : VpnService() {
             ipv6Bridge.start()
             bridge = ipv6Bridge
 
+            val boundAddress = scopedToTunnel(address, listener)
             startAirPlayServer(
                 generation,
-                AirPlayAttachment(scopedToTunnel(address, listener), config, identity, pairings, mfi, listener, media),
+                AirPlayAttachment(boundAddress, config, identity, pairings, mfi, listener, media),
             )
+            // Optional raw TCP echo/throughput channel on the same tun address.
+            // Failure here must not break CarPlay, so it is best-effort and logged.
+            runCatching {
+                val channel = DiplayTcpChannel(boundAddress) { message ->
+                    runCatching { listener.onDebugLog(message) }
+                }
+                channel.start()
+                probeChannel = channel
+            }.onFailure { error ->
+                Log.w(TAG, "NPCM channel not started: ${error.message}")
+            }
             AttachResult.Started
         } catch (error: Exception) {
             releaseLocked()
@@ -376,6 +389,8 @@ class CarPlayVpnService : VpnService() {
         serverSocket = null
         additionalServers.forEach { it.close() }
         additionalServers = emptyList()
+        probeChannel?.close()
+        probeChannel = null
         closeSessionsLocked()
         bridge?.close()
         bridge = null
