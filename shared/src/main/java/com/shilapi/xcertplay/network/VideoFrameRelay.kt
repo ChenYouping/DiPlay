@@ -45,13 +45,19 @@ object VideoFrameRelay {
     // recent IDR onwards and replay the entire GOP so the decoder gets a complete,
     // decodable chain that continues seamlessly into the live stream.
     private val gopLock = Any()
-    private val gopFrames = ArrayList<ByteArray>()
+    // Frame + monotonically increasing sequence. The sequence lets a connecting
+    // client skip any frame that was already sent in the GOP replay but also
+    // landed in the live queue — a duplicate P frame corrupts VideoToolbox's
+    // reference chain and causes permanent -12909 failures.
+    private data class SeqFrame(val seq: Long, val data: ByteArray)
+    private val gopFrames = ArrayList<SeqFrame>()
     private var gopBytes = 0
+    private var frameSeq = 0L
     private const val MAX_GOP_BYTES = 8 * 1024 * 1024
 
     interface Sink {
         fun onConfig(codecByte: Byte, data: ByteArray)
-        fun onFrame(frame: ByteArray)
+        fun onFrame(frame: ByteArray, seq: Long)
     }
 
     private val sinks = CopyOnWriteArrayList<Sink>()
@@ -73,24 +79,27 @@ object VideoFrameRelay {
         // replayed the whole GOP so its decoder has every reference P frames need.
         val codec = if (configRef.get()?.codecByte == 1.toByte()) VideoCodec.H265 else VideoCodec.H264
         val isKey = MediaCodecSupport.isRandomAccess(frame, codec)
+        val copy = frame.copyOf()
+        val seq: Long
         synchronized(gopLock) {
             if (isKey) { gopFrames.clear(); gopBytes = 0 }
             // Bound memory: if a single GOP grows huge (rare), drop the oldest
             // entries but keep the head IDR so the chain stays decodable.
-            if (gopBytes + frame.size > MAX_GOP_BYTES && gopFrames.size > 1) {
+            if (gopBytes + copy.size > MAX_GOP_BYTES && gopFrames.size > 1) {
                 val dropped = gopFrames.removeAt(1)
-                gopBytes -= dropped.size
+                gopBytes -= dropped.data.size
             }
-            gopFrames.add(frame.copyOf())
-            gopBytes += frame.size
+            frameSeq++
+            seq = frameSeq
+            gopFrames.add(SeqFrame(seq, copy))
+            gopBytes += copy.size
         }
         if (sinks.isEmpty()) return
-        val copy = frame.copyOf()
-        sinks.forEach { runCatching { it.onFrame(copy.copyOf()) } }
+        sinks.forEach { runCatching { it.onFrame(copy.copyOf(), seq) } }
     }
 
     /** Immutable snapshot of the current GOP for late-client catch-up. */
-    private fun snapshotGop(): List<ByteArray> = synchronized(gopLock) { gopFrames.map { it.copyOf() } }
+    private fun snapshotGop(): List<SeqFrame> = synchronized(gopLock) { gopFrames.map { SeqFrame(it.seq, it.data.copyOf()) } }
 
     fun subscribe(sink: Sink) {
         sinks.addIfAbsent(sink)
@@ -98,7 +107,7 @@ object VideoFrameRelay {
         // Replay the buffered GOP (IDR + all following P frames) so the decoder
         // has a complete reference chain instead of one orphan IDR.
         val replay = snapshotGop()
-        replay.forEach { runCatching { sink.onFrame(it) } }
+        replay.forEach { runCatching { sink.onFrame(it.data, it.seq) } }
         if (replay.isNotEmpty()) Log.i(TAG, "subscribe: replayed GOP of ${replay.size} frames")
     }
 
@@ -127,7 +136,7 @@ object VideoFrameRelay {
         // queued instead of written, so they cannot interleave into the replayed
         // reference chain and corrupt it. They are flushed in order afterwards.
         @Volatile private var replaying = false
-        private val replayQueue = java.util.ArrayDeque<ByteArray>()
+        private val replayQueue = java.util.ArrayDeque<SeqFrame>()
 
         fun start() {
             if (!running.compareAndSet(false, true)) return
@@ -138,9 +147,9 @@ object VideoFrameRelay {
             push(kind = 1, codec = codecByte.toInt(), body = data)
         }
 
-        override fun onFrame(frame: ByteArray) {
+        override fun onFrame(frame: ByteArray, seq: Long) {
             if (replaying) {
-                synchronized(replayQueue) { replayQueue.addLast(frame.copyOf()) }
+                synchronized(replayQueue) { replayQueue.addLast(SeqFrame(seq, frame.copyOf())) }
             } else {
                 push(kind = 2, codec = 0, body = frame)
             }
@@ -198,15 +207,28 @@ object VideoFrameRelay {
                             push(kind = 1, codec = cfg.codecByte.toInt(), body = cfg.data.copyOf())
                         }
                         val gop = snapshotGop()
-                        gop.forEach { push(kind = 2, codec = 0, body = it) }
-                        log("NPVS replayed GOP (${gop.size} frames) to new client")
-                        // Drain frames that arrived during replay, in arrival order.
-                        val pending: List<ByteArray>
+                        gop.forEach { push(kind = 2, codec = 0, body = it.data) }
+                        // Highest sequence already delivered via replay. Any queued
+                        // frame with seq <= this was in the snapshot too — sending it
+                        // again duplicates a P frame and permanently breaks the
+                        // decoder's reference chain (all subsequent frames -12909).
+                        val lastReplayed = gop.lastOrNull()?.seq ?: -1L
+                        log("NPVS replayed GOP (${gop.size} frames, lastSeq=$lastReplayed) to new client")
+                        // Drain only genuinely new live frames, strictly in order.
+                        val pending: List<SeqFrame>
                         synchronized(replayQueue) {
                             pending = replayQueue.toList()
                             replayQueue.clear()
                         }
-                        pending.forEach { push(kind = 2, codec = 0, body = it) }
+                        var skipped = 0
+                        pending.forEach { sf ->
+                            if (sf.seq <= lastReplayed) { skipped++ } else {
+                                push(kind = 2, codec = 0, body = sf.data)
+                            }
+                        }
+                        if (skipped > 0 || pending.isNotEmpty()) {
+                            log("NPVS live drain: ${pending.size} queued, skipped $skipped duplicates")
+                        }
                     } finally {
                         replaying = false
                     }
