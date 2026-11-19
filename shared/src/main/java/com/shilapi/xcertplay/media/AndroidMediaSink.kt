@@ -492,6 +492,13 @@ class AndroidMediaSink(
         }
         // Optional secondary screen mirror over NCM (main screen only).
         if (type == MAIN_SCREEN_TYPE) {
+            // Give the mirror server a way to ask the iPhone for a fresh IDR when a
+            // client connects. This reaches AirPlay's forceKeyFrame via the handler
+            // CarPlayMediaEngine installed in setVideoRecoveryHandler(); re-register
+            // on every config so a replaced screen always points at the live session.
+            com.shilapi.xcertplay.network.VideoFrameRelay.installKeyFrameRequester {
+                requestVideoRecovery(MAIN_SCREEN_TYPE)
+            }
             com.shilapi.xcertplay.network.VideoFrameRelay.relayConfig(codec.name, codecData)
         }
     }
