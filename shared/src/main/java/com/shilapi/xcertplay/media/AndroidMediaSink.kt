@@ -482,9 +482,10 @@ class AndroidMediaSink(
     }
 
     override fun onVideoConfig(type: Int, codecData: ByteArray) {
+        val codec: VideoCodec
         synchronized(videoOwnershipLock) {
             if (videoClosed) return
-            val codec = pendingVideoCodec[type] ?: VideoCodec.H264
+            codec = pendingVideoCodec[type] ?: VideoCodec.H264
             lastVideoConfig[type] = codec to codecData
             videoDecoder(type).configure(codec, codecData)
             mirrorDecoders(type).forEach { it.configure(codec, codecData) }
@@ -501,6 +502,10 @@ class AndroidMediaSink(
             if (videoClosed) return
             videoDecoder(type).submit(naluBytes)
             mirrorDecoders(type).forEach { it.submit(naluBytes) }
+        }
+        // Optional secondary screen mirror over NCM (main screen only).
+        if (type == MAIN_SCREEN_TYPE) {
+            com.shilapi.xcertplay.network.VideoFrameRelay.relayFrame(naluBytes)
         }
     }
 
