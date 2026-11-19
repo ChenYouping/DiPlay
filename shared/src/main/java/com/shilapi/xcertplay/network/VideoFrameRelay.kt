@@ -91,7 +91,7 @@ object VideoFrameRelay {
         }
 
         override fun onConfig(codecByte: Byte, data: ByteArray) {
-            push(kind = 1, codec = codecByte, body = data)
+            push(kind = 1, codec = codecByte.toInt(), body = data)
         }
 
         override fun onFrame(frame: ByteArray) {
