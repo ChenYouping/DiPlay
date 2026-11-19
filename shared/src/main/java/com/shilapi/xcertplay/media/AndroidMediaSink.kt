@@ -489,6 +489,10 @@ class AndroidMediaSink(
             videoDecoder(type).configure(codec, codecData)
             mirrorDecoders(type).forEach { it.configure(codec, codecData) }
         }
+        // Optional secondary screen mirror over NCM (main screen only).
+        if (type == MAIN_SCREEN_TYPE) {
+            com.shilapi.xcertplay.network.VideoFrameRelay.relayConfig(codec.name, codecData)
+        }
     }
 
     override fun onVideoFrame(type: Int, naluBytes: ByteArray) {
@@ -506,6 +510,10 @@ class AndroidMediaSink(
             if (videoClosed) return
             videoDecoder(type).submit(naluBytes, senderNanos, arrivalNanos)
             mirrorDecoders(type).forEach { it.submit(naluBytes) }
+        }
+        // Optional secondary screen mirror over NCM (main screen only).
+        if (type == MAIN_SCREEN_TYPE) {
+            com.shilapi.xcertplay.network.VideoFrameRelay.relayFrame(naluBytes)
         }
     }
 
