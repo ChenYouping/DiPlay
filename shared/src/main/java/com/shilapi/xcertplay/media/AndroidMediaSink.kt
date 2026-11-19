@@ -505,7 +505,7 @@ class AndroidMediaSink(
         }
         // Optional secondary screen mirror over NCM (main screen only).
         if (type == MAIN_SCREEN_TYPE) {
-            com.shilapi.xcertplay.network.VideoFrameRelay.relayFrame(naluBytes)
+            com.shilapi.xcertplay.network.VideoFrameRelay.relayFrame(MediaCodecSupport.toAnnexB(naluBytes))
         }
     }
 
@@ -518,7 +518,7 @@ class AndroidMediaSink(
         }
         // Optional secondary screen mirror over NCM (main screen only).
         if (type == MAIN_SCREEN_TYPE) {
-            com.shilapi.xcertplay.network.VideoFrameRelay.relayFrame(naluBytes)
+            com.shilapi.xcertplay.network.VideoFrameRelay.relayFrame(MediaCodecSupport.toAnnexB(naluBytes))
         }
     }
 
