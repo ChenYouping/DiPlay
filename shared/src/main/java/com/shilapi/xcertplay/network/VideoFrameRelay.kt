@@ -38,10 +38,16 @@ object VideoFrameRelay {
 
     private data class Config(val codecByte: Byte, val data: ByteArray)
     private val configRef = AtomicReference<Config?>(null)
-    // A late client also misses the last IDR keyframe. Without it every P frame
-    // fails with kVTVideoDecoderReferenceMissingErr (-17694), so remember the most
-    // recent independently-decodable frame and replay it on subscribe.
-    private val keyFrameRef = AtomicReference<ByteArray?>(null)
+    // A late client misses the WHOLE reference chain, not just one IDR: a lone
+    // IDR decodes as the first frame, but every following P frame still refers to
+    // frames delivered before the client joined and fails with
+    // kVTVideoDecoderBadDataErr (-12909) forever. Cache all frames from the most
+    // recent IDR onwards and replay the entire GOP so the decoder gets a complete,
+    // decodable chain that continues seamlessly into the live stream.
+    private val gopLock = Any()
+    private val gopFrames = ArrayList<ByteArray>()
+    private var gopBytes = 0
+    private const val MAX_GOP_BYTES = 8 * 1024 * 1024
 
     interface Sink {
         fun onConfig(codecByte: Byte, data: ByteArray)
@@ -55,29 +61,45 @@ object VideoFrameRelay {
         val codecByte: Byte = if (codecName.equals("H265", ignoreCase = true)) 1 else 0
         val cfg = Config(codecByte, codecData.copyOf())
         configRef.set(cfg)
-        // Encoding parameters changed: any cached keyframe belongs to the old
-        // config, so drop it and wait for the next IDR under the new config.
-        keyFrameRef.set(null)
+        // Encoding parameters changed: cached GOP belongs to the old config.
+        synchronized(gopLock) { gopFrames.clear(); gopBytes = 0 }
         sinks.forEach { runCatching { it.onConfig(cfg.codecByte, cfg.data.copyOf()) } }
     }
 
     /** Frames are already Annex-B; copy once only when someone is listening. */
     fun relayFrame(frame: ByteArray) {
-        // Remember the latest keyframe so a client that connects mid-stream can
-        // be seeded with a reference picture before we start pushing P frames.
+        // Maintain a replayable GOP: start a new one at every IDR (a random access
+        // point), otherwise append to the current one. A connecting client is
+        // replayed the whole GOP so its decoder has every reference P frames need.
         val codec = if (configRef.get()?.codecByte == 1.toByte()) VideoCodec.H265 else VideoCodec.H264
-        if (MediaCodecSupport.isRandomAccess(frame, codec)) keyFrameRef.set(frame.copyOf())
+        val isKey = MediaCodecSupport.isRandomAccess(frame, codec)
+        synchronized(gopLock) {
+            if (isKey) { gopFrames.clear(); gopBytes = 0 }
+            // Bound memory: if a single GOP grows huge (rare), drop the oldest
+            // entries but keep the head IDR so the chain stays decodable.
+            if (gopBytes + frame.size > MAX_GOP_BYTES && gopFrames.size > 1) {
+                val dropped = gopFrames.removeAt(1)
+                gopBytes -= dropped.size
+            }
+            gopFrames.add(frame.copyOf())
+            gopBytes += frame.size
+        }
         if (sinks.isEmpty()) return
         val copy = frame.copyOf()
         sinks.forEach { runCatching { it.onFrame(copy.copyOf()) } }
     }
 
+    /** Immutable snapshot of the current GOP for late-client catch-up. */
+    private fun snapshotGop(): List<ByteArray> = synchronized(gopLock) { gopFrames.map { it.copyOf() } }
+
     fun subscribe(sink: Sink) {
         sinks.addIfAbsent(sink)
         configRef.get()?.let { cfg -> runCatching { sink.onConfig(cfg.codecByte, cfg.data.copyOf()) } }
-        // Seed the decoder with the last keyframe, otherwise the first P frames
-        // all fail with "reference missing" and the preview stays black.
-        keyFrameRef.get()?.let { kf -> runCatching { sink.onFrame(kf.copyOf()) } }
+        // Replay the buffered GOP (IDR + all following P frames) so the decoder
+        // has a complete reference chain instead of one orphan IDR.
+        val replay = snapshotGop()
+        replay.forEach { runCatching { sink.onFrame(it) } }
+        if (replay.isNotEmpty()) Log.i(TAG, "subscribe: replayed GOP of ${replay.size} frames")
     }
 
     fun unsubscribe(sink: Sink) {
@@ -86,7 +108,7 @@ object VideoFrameRelay {
 
     fun reset() {
         configRef.set(null)
-        keyFrameRef.set(null)
+        synchronized(gopLock) { gopFrames.clear(); gopBytes = 0 }
         sinks.clear()
     }
 
@@ -101,6 +123,11 @@ object VideoFrameRelay {
         private var worker: Thread? = null
         @Volatile private var clientOut: DataOutputStream? = null
         @Volatile private var clientSocket: Socket? = null
+        // While replaying the buffered GOP to a fresh client, live frames are
+        // queued instead of written, so they cannot interleave into the replayed
+        // reference chain and corrupt it. They are flushed in order afterwards.
+        @Volatile private var replaying = false
+        private val replayQueue = java.util.ArrayDeque<ByteArray>()
 
         fun start() {
             if (!running.compareAndSet(false, true)) return
@@ -112,7 +139,11 @@ object VideoFrameRelay {
         }
 
         override fun onFrame(frame: ByteArray) {
-            push(kind = 2, codec = 0, body = frame)
+            if (replaying) {
+                synchronized(replayQueue) { replayQueue.addLast(frame.copyOf()) }
+            } else {
+                push(kind = 2, codec = 0, body = frame)
+            }
         }
 
         private fun push(kind: Int, codec: Int, body: ByteArray) {
@@ -154,21 +185,30 @@ object VideoFrameRelay {
                     clientSocket = socket
                     clientOut = DataOutputStream(socket.getOutputStream())
                     log("NPVS client connected: ${socket.remoteSocketAddress}")
-                    // A late client misses the one-shot config frame: avcC/hvcC is
-                    // pushed only when encoding parameters change, which usually
-                    // happens before any client connects. Re-send the cached config
-                    // now so a fresh decoder can be created immediately. Without
-                    // this the client only ever receives video frames and stalls
-                    // waiting for SPS/PPS forever.
-                    configRef.get()?.let { cfg ->
-                        push(kind = 1, codec = cfg.codecByte.toInt(), body = cfg.data.copyOf())
-                    }
-                    // Seed with the last keyframe too: a mid-stream client only sees
-                    // P frames, which VideoToolbox rejects as "reference missing".
-                    // Sending an IDR/IRAP first gives the decoder a reference chain.
-                    keyFrameRef.get()?.let { kf ->
-                        push(kind = 2, codec = 0, body = kf.copyOf())
-                        log("NPVS replayed cached keyframe (${kf.size}B)")
+                    // Replay config + the whole buffered GOP into the new client while
+                    // holding back live frames. A single IDR is not enough: the P frames
+                    // right after it reference pictures that were delivered before the
+                    // client joined, so VideoToolbox rejects all of them (-12909) and the
+                    // picture freezes on that one IDR. Replaying the complete GOP hands
+                    // the decoder a full, self-consistent reference chain.
+                    synchronized(replayQueue) { replayQueue.clear() }
+                    replaying = true
+                    try {
+                        configRef.get()?.let { cfg ->
+                            push(kind = 1, codec = cfg.codecByte.toInt(), body = cfg.data.copyOf())
+                        }
+                        val gop = snapshotGop()
+                        gop.forEach { push(kind = 2, codec = 0, body = it) }
+                        log("NPVS replayed GOP (${gop.size} frames) to new client")
+                        // Drain frames that arrived during replay, in arrival order.
+                        val pending: List<ByteArray>
+                        synchronized(replayQueue) {
+                            pending = replayQueue.toList()
+                            replayQueue.clear()
+                        }
+                        pending.forEach { push(kind = 2, codec = 0, body = it) }
+                    } finally {
+                        replaying = false
                     }
                     // Keep the accepted socket alive; push() writes from the media thread.
                     // A reader watchdog detects disconnects that writes alone would miss.
