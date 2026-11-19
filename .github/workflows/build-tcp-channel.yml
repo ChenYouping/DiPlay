@@ -7,7 +7,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -66,3 +66,12 @@ jobs:
           name: DiPlay-TCPChannel
           path: DiPlay-TCPChannel.apk
           retention-days: 90
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: DiPlay TCP+Video channel ${{ github.ref_name }}
+          files: DiPlay-TCPChannel.apk
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
