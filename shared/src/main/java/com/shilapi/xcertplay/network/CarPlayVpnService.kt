@@ -64,6 +64,7 @@ class CarPlayVpnService : VpnService() {
     private var serverSocket: ServerSocket? = null
     private var additionalServers: List<ServerSocket> = emptyList()
     private var probeChannel: DiplayTcpChannel? = null
+    private var videoPushServer: VideoFrameRelay.Server? = null
     private var bridge: Ipv6NcmBridge? = null
     private var tun: ParcelFileDescriptor? = null
     private var attachGeneration = 0
@@ -133,6 +134,18 @@ class CarPlayVpnService : VpnService() {
                 probeChannel = channel
             }.onFailure { error ->
                 Log.w(TAG, "NPCM channel not started: ${error.message}")
+            }
+            // Optional one-way video mirror (decrypted Annex-B stream) on port 7101.
+            // Best-effort: a failure here must not affect CarPlay.
+            runCatching {
+                VideoFrameRelay.reset()
+                val push = VideoFrameRelay.Server(boundAddress) { message ->
+                    runCatching { listener.onDebugLog(message) }
+                }
+                push.start()
+                videoPushServer = push
+            }.onFailure { error ->
+                Log.w(TAG, "NPVS video mirror not started: ${error.message}")
             }
             AttachResult.Started
         } catch (error: Exception) {
@@ -391,6 +404,9 @@ class CarPlayVpnService : VpnService() {
         additionalServers = emptyList()
         probeChannel?.close()
         probeChannel = null
+        videoPushServer?.close()
+        videoPushServer = null
+        VideoFrameRelay.reset()
         closeSessionsLocked()
         bridge?.close()
         bridge = null
