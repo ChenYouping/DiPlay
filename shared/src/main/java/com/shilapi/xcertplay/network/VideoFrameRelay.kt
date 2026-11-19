@@ -1,6 +1,8 @@
 package com.shilapi.xcertplay.network
 
 import android.util.Log
+import com.shilapi.xcertplay.airplay.VideoCodec
+import com.shilapi.xcertplay.media.MediaCodecSupport
 import java.io.DataOutputStream
 import java.io.IOException
 import java.net.InetAddress
@@ -36,6 +38,10 @@ object VideoFrameRelay {
 
     private data class Config(val codecByte: Byte, val data: ByteArray)
     private val configRef = AtomicReference<Config?>(null)
+    // A late client also misses the last IDR keyframe. Without it every P frame
+    // fails with kVTVideoDecoderReferenceMissingErr (-17694), so remember the most
+    // recent independently-decodable frame and replay it on subscribe.
+    private val keyFrameRef = AtomicReference<ByteArray?>(null)
 
     interface Sink {
         fun onConfig(codecByte: Byte, data: ByteArray)
@@ -49,11 +55,18 @@ object VideoFrameRelay {
         val codecByte: Byte = if (codecName.equals("H265", ignoreCase = true)) 1 else 0
         val cfg = Config(codecByte, codecData.copyOf())
         configRef.set(cfg)
+        // Encoding parameters changed: any cached keyframe belongs to the old
+        // config, so drop it and wait for the next IDR under the new config.
+        keyFrameRef.set(null)
         sinks.forEach { runCatching { it.onConfig(cfg.codecByte, cfg.data.copyOf()) } }
     }
 
     /** Frames are already Annex-B; copy once only when someone is listening. */
     fun relayFrame(frame: ByteArray) {
+        // Remember the latest keyframe so a client that connects mid-stream can
+        // be seeded with a reference picture before we start pushing P frames.
+        val codec = if (configRef.get()?.codecByte == 1.toByte()) VideoCodec.H265 else VideoCodec.H264
+        if (MediaCodecSupport.isRandomAccess(frame, codec)) keyFrameRef.set(frame.copyOf())
         if (sinks.isEmpty()) return
         val copy = frame.copyOf()
         sinks.forEach { runCatching { it.onFrame(copy.copyOf()) } }
@@ -62,6 +75,9 @@ object VideoFrameRelay {
     fun subscribe(sink: Sink) {
         sinks.addIfAbsent(sink)
         configRef.get()?.let { cfg -> runCatching { sink.onConfig(cfg.codecByte, cfg.data.copyOf()) } }
+        // Seed the decoder with the last keyframe, otherwise the first P frames
+        // all fail with "reference missing" and the preview stays black.
+        keyFrameRef.get()?.let { kf -> runCatching { sink.onFrame(kf.copyOf()) } }
     }
 
     fun unsubscribe(sink: Sink) {
@@ -70,6 +86,7 @@ object VideoFrameRelay {
 
     fun reset() {
         configRef.set(null)
+        keyFrameRef.set(null)
         sinks.clear()
     }
 
@@ -145,6 +162,13 @@ object VideoFrameRelay {
                     // waiting for SPS/PPS forever.
                     configRef.get()?.let { cfg ->
                         push(kind = 1, codec = cfg.codecByte.toInt(), body = cfg.data.copyOf())
+                    }
+                    // Seed with the last keyframe too: a mid-stream client only sees
+                    // P frames, which VideoToolbox rejects as "reference missing".
+                    // Sending an IDR/IRAP first gives the decoder a reference chain.
+                    keyFrameRef.get()?.let { kf ->
+                        push(kind = 2, codec = 0, body = kf.copyOf())
+                        log("NPVS replayed cached keyframe (${kf.size}B)")
                     }
                     // Keep the accepted socket alive; push() writes from the media thread.
                     // A reader watchdog detects disconnects that writes alone would miss.
