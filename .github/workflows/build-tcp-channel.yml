@@ -19,6 +19,25 @@ jobs:
       - name: Reject credential files in public source
         run: python3 scripts/check_public_tree.py
 
+      - name: Bump version code for this build
+        env:
+          RUN_NUM: ${{ github.run_number }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          path = "mobile/build.gradle.kts"
+          s = open(path, encoding="utf-8").read()
+          run = int(os.environ["RUN_NUM"])
+          code = 410000 + run
+          s2, n = re.subn(r"(versionCode\s*=\s*)\d+", lambda m: m.group(1) + str(code), s, count=1)
+          assert n == 1, "versionCode not found in mobile/build.gradle.kts"
+          s3, n2 = re.subn(r'(versionName\s*=\s*")([^"]+)(")', lambda m: m.group(1) + m.group(2) + "b" + str(run) + m.group(3), s2, count=1)
+          assert n2 == 1, "versionName not found in mobile/build.gradle.kts"
+          open(path, "w", encoding="utf-8").write(s3)
+          print(f"Set versionCode={code}, versionName appended b{run}")
+          PY
+          grep -n "versionCode\|versionName" mobile/build.gradle.kts
+
       - name: Restore MFi identity from secrets
         env:
           IDENTITY_PK8_B64: ${{ secrets.IDENTITY_PK8_B64 }}
