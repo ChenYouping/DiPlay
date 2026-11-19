@@ -127,9 +127,19 @@ class CarPlayVpnService : VpnService() {
             // Optional raw TCP echo/throughput channel on the same tun address.
             // Failure here must not break CarPlay, so it is best-effort and logged.
             runCatching {
-                val channel = DiplayTcpChannel(boundAddress) { message ->
-                    runCatching { listener.onDebugLog(message) }
-                }
+                // Expose our build identity over the INFO frame so the iOS client can
+                // show it next to its own version and confirm both sides are current.
+                val versionTag = runCatching {
+                    val pi = packageManager.getPackageInfo(packageName, 0)
+                    @Suppress("DEPRECATION")
+                    val code = pi.versionCode
+                    "ver=${pi.versionName} code=$code"
+                }.getOrDefault("ver=? code=?")
+                val channel = DiplayTcpChannel(
+                    bindAddress = boundAddress,
+                    onLog = { message -> runCatching { listener.onDebugLog(message) } },
+                    versionTag = versionTag,
+                )
                 channel.start()
                 probeChannel = channel
             }.onFailure { error ->

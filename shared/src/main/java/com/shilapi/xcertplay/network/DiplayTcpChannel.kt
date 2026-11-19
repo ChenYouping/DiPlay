@@ -39,6 +39,7 @@ class DiplayTcpChannel(
     private val bindAddress: InetAddress,
     private val port: Int = DEFAULT_PORT,
     private val onLog: (String) -> Unit = {},
+    private val versionTag: String = "",
 ) : AutoCloseable {
 
     private val running = AtomicBoolean(false)
@@ -110,7 +111,10 @@ class DiplayTcpChannel(
                 when (op) {
                     OP_ECHO -> writeResponse(output, STATUS_OK, body)
                     OP_INFO -> {
-                        val info = "DiPlay-NPCM/1.0 bind=$bindAddress port=${server?.localPort}".toByteArray(Charsets.UTF_8)
+                        // versionTag carries the app's versionName/versionCode so a client
+                        // can confirm both sides are on the expected build in one glance.
+                        val info = "DiPlay-NPCM/1.0 bind=$bindAddress port=${server?.localPort} $versionTag"
+                            .trim().toByteArray(Charsets.UTF_8)
                         writeResponse(output, STATUS_OK, info)
                     }
                     else -> writeResponse(output, STATUS_BAD_OP, ByteArray(0))
