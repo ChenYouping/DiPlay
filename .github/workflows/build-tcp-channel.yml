@@ -1,0 +1,65 @@
+name: Build DiPlay + TCP channel (with identity)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject credential files in public source
+        run: python3 scripts/check_public_tree.py
+
+      - name: Restore MFi identity from secrets
+        env:
+          IDENTITY_PK8_B64: ${{ secrets.IDENTITY_PK8_B64 }}
+          CERT_P7B_B64: ${{ secrets.CERT_P7B_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IDENTITY_PK8_B64:-}" ] || [ -z "${CERT_P7B_B64:-}" ]; then
+            echo "::error::Secrets IDENTITY_PK8_B64 and CERT_P7B_B64 must be set in repository settings."
+            exit 1
+          fi
+          mkdir -p runtime-assets/offline-mfi
+          printf '%s' "$IDENTITY_PK8_B64" | base64 -d > runtime-assets/offline-mfi/identity.pk8
+          printf '%s' "$CERT_P7B_B64" | base64 -d > runtime-assets/offline-mfi/certificate.p7b
+          echo "identity.pk8 bytes: $(wc -c < runtime-assets/offline-mfi/identity.pk8)"
+          echo "certificate.p7b bytes: $(wc -c < runtime-assets/offline-mfi/certificate.p7b)"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools platforms;android-37.0 build-tools;36.0.0 ndk;28.2.13676358
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build standalone debug APK with identity + TCP channel
+        env:
+          DIPLAY_AUTH_ASSETS_DIR: ${{ github.workspace }}/runtime-assets
+        run: ./gradlew :mobile:assembleStandaloneDebug --stacktrace
+
+      - name: Collect APK
+        run: |
+          set -euo pipefail
+          APK=$(find mobile/build/outputs/apk -name '*.apk' | head -1)
+          test -n "$APK" && test -f "$APK"
+          echo "APK_PATH=$APK"
+          cp "$APK" DiPlay-TCPChannel.apk
+          sha256sum DiPlay-TCPChannel.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiPlay-TCPChannel
+          path: DiPlay-TCPChannel.apk
+          retention-days: 90
